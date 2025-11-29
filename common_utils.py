@@ -8,16 +8,12 @@ import tensorflow as tf
 from torch.utils.dlpack import from_dlpack
 
 # Sionna関連のインポート
-from sionna.phy.ofdm import ResourceGrid
+from sionna.phy.ofdm import ResourceGrid, PilotPattern, LSChannelEstimator
 from sionna.phy.channel.tr38901 import AntennaArray, CDL
 from sionna.phy.channel import subcarrier_frequencies, cir_to_ofdm_channel
 
 # --- 定数設定 ---
-# SNRが不明であることを示す値
 UNKNOWN_SNR_VALUE = -100.0
-
-# ★変更点: パイロットの周波数方向の間引き間隔
-# 8サブキャリアごとに1つだけパイロットを配置（かなりスカスカにする）
 PILOT_FREQ_STEP = 8 
 
 # GPU設定
@@ -27,112 +23,132 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 gpus = tf.config.list_physical_devices('GPU')
 if gpus:
     try:
-        # TFがメモリを食いつぶさないようにGrowthモードにする
         tf.config.experimental.set_memory_growth(gpus[0], True)
     except RuntimeError as e:
         print(e)
 
 # ==========================================
-# 1. データ生成クラス (Sparse Pilot対応版)
+# 1. データ生成クラス (Sionna標準準拠版)
 # ==========================================
 class SionnaChannelGeneratorGPU:
     def __init__(self, batch_size=32):
         self.batch_size = batch_size
-        self.pilot_indices = [2, 11] # 時間方向のパイロット位置
+        self.pilot_symbol_indices = [2, 11] # 時間方向のパイロット位置
         self.num_symbols = 14
+        self.fft_size = 76
+        self.num_tx = 1
+        self.num_streams = 4 # num_streams_per_tx
         
-        # --- Sionna設定 ---
+        # --- Sionna設定: パイロットパターンの定義 ---
+        # "kronecker"ではなく、明示的にマスクを作成してSionnaに認識させる
+        
+        # マスク形状: [num_tx, num_streams_per_tx, num_ofdm_symbols, fft_size]
+        pilot_mask = np.zeros((self.num_tx, self.num_streams, self.num_symbols, self.fft_size), dtype=bool)
+        
+        # 指定されたシンボル(2, 11)の、指定された周波数間隔(8)の位置をTrueにする
+        pilot_mask[:, :, self.pilot_symbol_indices, ::PILOT_FREQ_STEP] = True
+        
+        # カスタムパイロットパターンの作成
+        self.pilot_pattern = PilotPattern(mask=pilot_mask, pilot_sequence="kronecker")
+        
+        # ResourceGridにカスタムパターンを渡す
         self.rg = ResourceGrid(
             num_ofdm_symbols=self.num_symbols,
-            fft_size=76, subcarrier_spacing=15e3,
-            num_tx=1, num_streams_per_tx=4,
-            cyclic_prefix_length=6, pilot_pattern="kronecker",
-            pilot_ofdm_symbol_indices=self.pilot_indices
+            fft_size=self.fft_size,
+            subcarrier_spacing=15e3,
+            num_tx=self.num_tx, 
+            num_streams_per_tx=self.num_streams,
+            cyclic_prefix_length=6, 
+            pilot_pattern=self.pilot_pattern # <--- ここが重要
         )
+        
+        # LS推定器 (線形補間モード) を準備
+        # これにより、手動計算ではなくSionnaの機能で補間を行う
+        self.ls_estimator = LSChannelEstimator(self.rg, interpolation_type="lin")
+
         carrier_freq = 2.6e9
         ut_array = AntennaArray(num_rows=1, num_cols=2, polarization="dual", polarization_type="cross", antenna_pattern="38.901", carrier_frequency=carrier_freq)
         bs_array = AntennaArray(num_rows=1, num_cols=2, polarization="dual", polarization_type="cross", antenna_pattern="38.901", carrier_frequency=carrier_freq)
         
-        # ★変更点: 遅延広がり(Delay Spread)を 300ns -> 3000ns に拡大
-        # これにより周波数選択性が強くなり、単純な線形補間が難しくなる
         self.cdl = CDL("B", 3000e-9, carrier_freq, ut_array, bs_array, "uplink", min_speed=10)
         
         self.frequencies = subcarrier_frequencies(self.rg.fft_size, self.rg.subcarrier_spacing)
-        
-        # 線形補間用の時間グリッド (GPU)
-        self.t_grid = torch.arange(self.num_symbols, device=device).view(1, 1, -1, 1).float()
 
     def get_batch(self, snr_db=10.0):
-        # 1. Sionnaで真のチャネル生成 (全周波数・全時間)
+        # 1. Sionnaで真のチャネル生成
+        # Output: [batch, num_rx, num_rx_ant, num_tx, num_tx_ant, num_ofdm_symbols, fft_size]
         a, tau = self.cdl(batch_size=self.batch_size, 
                           num_time_steps=self.rg.num_ofdm_symbols, 
                           sampling_frequency=1/self.rg.ofdm_symbol_duration)
         
         h_freq = cir_to_ofdm_channel(self.frequencies, a, tau, normalize=True)
         
-        # DLPackによるゼロコピー転送
-        try:
-            h_torch_complex = from_dlpack(tf.experimental.dlpack.to_dlpack(h_freq))
-            h_torch_complex = h_torch_complex.cfloat() # 型変換
-        except Exception:
-            h_torch_complex = torch.from_numpy(h_freq.numpy()).cfloat().to(device)
-
-        if h_torch_complex.device != device:
-             h_torch_complex = h_torch_complex.to(device)
+        # 2. LS推定用の受信信号(y)をシミュレート
+        # y = h * x + n ですが、チャネル推定タスクではパイロット位置の x=1 と仮定して
+        # y_pilot = h_pilot + n を作れば良い。
         
-        # Reshape: [Batch, Rx, RxAnt, Tx, TxAnt, T, F] -> [Batch, Channels, T, F]
-        b, rx, rx_ant, tx, tx_ant, t, f = h_torch_complex.shape
-        h_gt_complex = h_torch_complex.view(b, rx*rx_ant*tx*tx_ant, t, f)
-
-        # 2. パイロット抽出とノイズ付加
-        t1, t2 = self.pilot_indices[0], self.pilot_indices[1]
-        val_t1_clean = h_gt_complex[:, :, t1:t1+1, :]
-        val_t2_clean = h_gt_complex[:, :, t2:t2+1, :]
-        
-        sig_pwr = torch.mean(torch.abs(h_gt_complex)**2)
+        # ノイズ生成
+        sig_pwr = tf.reduce_mean(tf.abs(h_freq)**2)
         snr_linear = 10.0 ** (snr_db / 10.0)
-        noise_pwr = sig_pwr / snr_linear
-        noise_std = torch.sqrt(noise_pwr / 2.0)
+        noise_pwr = sig_pwr / tf.cast(snr_linear, h_freq.dtype)
+        no = noise_pwr # ノイズ分散
         
-        noise_n1 = (torch.randn_like(val_t1_clean) + 1j * torch.randn_like(val_t1_clean)) * noise_std
-        noise_n2 = (torch.randn_like(val_t2_clean) + 1j * torch.randn_like(val_t2_clean)) * noise_std
+        noise = tf.complex(
+            tf.random.normal(tf.shape(h_freq), stddev=tf.sqrt(noise_pwr/2.0)),
+            tf.random.normal(tf.shape(h_freq), stddev=tf.sqrt(noise_pwr/2.0))
+        )
         
-        val_t1_noisy_full = val_t1_clean + noise_n1
-        val_t2_noisy_full = val_t2_clean + noise_n2
+        # 観測信号 y (全リソースエレメントにノイズを乗せる)
+        # ※SionnaのLSChannelEstimatorはパイロット位置の値だけをピックアップして使うため、
+        # データ部分に何が入っていても（あるいはhそのままでも）推定には影響しません。
+        y_obs = h_freq + noise
 
-        # ==========================================
-        # ★変更点: 周波数方向の間引き (Sparsification)
-        # ==========================================
-        # 0, 8, 16... のインデックスのみを取得
-        f_indices = torch.arange(0, self.rg.fft_size, PILOT_FREQ_STEP, device=device)
+        # 3. Sionna標準のLS推定 + 線形補間を実行
+        # これにより、手動でスライスや補間を書く必要がなくなります
+        # shape: [batch, num_rx, num_rx_ant, num_tx, num_tx_ant, num_symbols, fft_size]
+        h_hat, _ = self.ls_estimator(y_obs, no)
         
-        # 間引かれたパイロットデータ
-        val_t1_sparse = val_t1_noisy_full[:, :, :, f_indices] # [B, C, 1, F_sparse]
-        val_t2_sparse = val_t2_noisy_full[:, :, :, f_indices]
-
-        # 3. 補間 (x_condの作成)
-        # Step A: 時間方向の線形補間 (間引かれた周波数位置のみ)
-        slope_sparse = (val_t2_sparse - val_t1_sparse) / (t2 - t1)
-        h_sparse_time_interp = val_t1_sparse + slope_sparse * (self.t_grid - t1) # [B, C, T, F_sparse]
+        # 4. PyTorch形式に変換 (学習用データの整形)
+        # h_freq (Ground Truth) と h_hat (Conditional Input)
         
-        # Step B: 周波数方向の引き伸ばし (Bilinear Interpolation)
-        # 間引かれたデータを元のサイズ(76)に引き伸ばして入力ヒントとする
-        h_real = h_sparse_time_interp.real
-        h_imag = h_sparse_time_interp.imag
+        # 形状を [Batch, Channels, T, F] に合わせる
+        # Channels = Rx * RxAnt * Tx * TxAnt = 1 * 2 * 1 * 2 = 4 ?
+        # 実際のCDL出力形状に依存しますが、ここではフラット化します
         
-        target_size = (self.rg.num_ofdm_symbols, self.rg.fft_size)
-        
-        # align_corners=True で位置ズレを最小限に抑えつつリサイズ
-        cond_real = torch.nn.functional.interpolate(h_real, size=target_size, mode='bilinear', align_corners=True)
-        cond_imag = torch.nn.functional.interpolate(h_imag, size=target_size, mode='bilinear', align_corners=True)
-        
-        h_cond_complex = torch.complex(cond_real, cond_imag)
-
-        # 4. 実部・虚部の結合
-        x_gt = torch.cat([h_gt_complex.real, h_gt_complex.imag], dim=1).float()
-        x_cond = torch.cat([h_cond_complex.real, h_cond_complex.imag], dim=1).float()
+        # テンソルをGPU上のPyTorchへ変換
+        x_gt = self._tf_to_torch(h_freq)
+        x_cond = self._tf_to_torch(h_hat)
         
         return x_gt, x_cond
+
+    def _tf_to_torch(self, tf_tensor):
+        """TensorFlowテンソルを[B, C_real+imag, T, F]のPyTorchテンソルに変換"""
+        # 複素数 -> 実部・虚部結合
+        # 元の形状: [B, 1, RxAnt, 1, TxAnt, T, F] などを想定
+        # ここでは全アンテナペアをチャンネル次元にまとめる
+        
+        # [B, ..., T, F] -> [B, -1, T, F]
+        b = tf_tensor.shape[0]
+        t = tf_tensor.shape[-2]
+        f = tf_tensor.shape[-1]
+        
+        # 軸を入れ替えてフラット化の準備 [B, ..., T, F]
+        # アンテナ次元を統合
+        flat_tensor = tf.reshape(tf_tensor, [b, -1, t, f])
+        
+        try:
+            # DLPackでゼロコピー変換
+            torch_tensor = from_dlpack(tf.experimental.dlpack.to_dlpack(flat_tensor))
+            torch_tensor = torch_tensor.cfloat()
+        except Exception:
+            torch_tensor = torch.from_numpy(flat_tensor.numpy()).cfloat().to(device)
+            
+        if torch_tensor.device != device:
+             torch_tensor = torch_tensor.to(device)
+             
+        # 実部と虚部をチャンネル方向に結合 [B, C*2, T, F]
+        x_out = torch.cat([torch_tensor.real, torch_tensor.imag], dim=1).float()
+        return x_out
 
 # ==========================================
 # 2. モデル定義 (変更なし)
@@ -142,7 +158,6 @@ class ConditionalUNet(nn.Module):
         super().__init__()
         total_in_channels = in_channels + cond_channels
         
-        # Time Embedding
         self.time_mlp = nn.Sequential(
             nn.Linear(1, time_emb_dim),
             nn.GELU(),
@@ -150,7 +165,6 @@ class ConditionalUNet(nn.Module):
         )
         self.time_proj = nn.Linear(time_emb_dim, 512)
 
-        # SNR Embedding
         self.snr_mlp = nn.Sequential(
             nn.Linear(1, time_emb_dim),
             nn.GELU(),
@@ -174,12 +188,10 @@ class ConditionalUNet(nn.Module):
     def forward(self, x, cond, t, snr): 
         x_in = torch.cat([x, cond], dim=1) 
         
-        # Time Embedding
         t = t.float().view(-1, 1) / 1000.0
         t_emb = self.time_mlp(t)
         t_emb = self.time_proj(t_emb).view(-1, 512, 1, 1)
 
-        # SNR Embedding
         s = snr.float().view(-1, 1) / 30.0 
         s_emb = self.snr_mlp(s)
         s_emb = self.snr_proj(s_emb).view(-1, 512, 1, 1)

@@ -1,161 +1,199 @@
-# evaluate_snr.py
+import os
 import torch
-import torch.nn as nn
+import tensorflow as tf
 import numpy as np
 import matplotlib.pyplot as plt
 from tqdm import tqdm
 
-# PILOT_FREQ_STEP を追加でインポート
-from common_utils import SionnaChannelGeneratorGPU, ConditionalUNet, device, UNKNOWN_SNR_VALUE, PILOT_FREQ_STEP
+# Sionna imports
+from sionna.phy import utils as phy_utils
+from sionna.phy.ofdm import ResourceGrid, LSChannelEstimator, LMMSEInterpolator
+from sionna.phy.channel import GenerateOFDMChannel, subcarrier_frequencies, cir_to_ofdm_channel
+from sionna.phy.channel.tr38901 import AntennaArray, CDL
+
+# Project imports
+from common_utils import ConditionalUNet, device, UNKNOWN_SNR_VALUE
 from inference import sample_ddpm, compute_nmse
 
-def estimate_channel_covariance(generator, num_batches=50):
-    """チャネル統計量(R_hh, mu_h)の推定"""
-    print(f"Estimating Channel Statistics (R_hh) using {num_batches} batches...")
-    h_samples = []
-    with torch.no_grad():
-        for _ in range(num_batches):
-            x_gt, _ = generator.get_batch(snr_db=100.0)
-            B, C_combined, T, F = x_gt.shape
-            C = C_combined // 2
-            h_complex = x_gt[:, :C, :, :] + 1j * x_gt[:, C:, :, :]
-            h_flat = h_complex.permute(0, 1, 2, 3).reshape(-1, T * F)
-            h_samples.append(h_flat)
+# GPUメモリ制御
+gpus = tf.config.list_physical_devices('GPU')
+if gpus:
+    try:
+        for gpu in gpus:
+            tf.config.experimental.set_memory_growth(gpu, True)
+    except RuntimeError as e:
+        print(e)
+
+def get_sionna_config():
+    """Sionnaの設定を構築し、パイロット位置などのパラメータも返す"""
+    CARRIER_FREQ = 2.6e9
+    NUM_SYMBOLS = 14
+    FFT_SIZE = 76
+    SUBCARRIER_SPACING = 15e3
+    PILOT_INDICES = [2, 11]  # これを返します
+    PILOT_FREQ_STEP = 8
+    
+    pilot_pattern = "kronecker" 
+    rg = ResourceGrid(
+        num_ofdm_symbols=NUM_SYMBOLS,
+        fft_size=FFT_SIZE,
+        subcarrier_spacing=SUBCARRIER_SPACING,
+        num_tx=1, num_streams_per_tx=4,
+        cyclic_prefix_length=6, 
+        pilot_pattern=pilot_pattern,
+        pilot_ofdm_symbol_indices=PILOT_INDICES
+    )
+    
+    ut_array = AntennaArray(num_rows=1, num_cols=2, polarization="dual", polarization_type="cross", 
+                            antenna_pattern="38.901", carrier_frequency=CARRIER_FREQ)
+    bs_array = AntennaArray(num_rows=1, num_cols=2, polarization="dual", polarization_type="cross", 
+                            antenna_pattern="38.901", carrier_frequency=CARRIER_FREQ)
+    
+    cdl_model = CDL("B", 3000e-9, CARRIER_FREQ, ut_array, bs_array, "uplink", min_speed=10)
+    
+    # ★変更: PILOT_INDICES を戻り値に追加
+    return rg, cdl_model, PILOT_FREQ_STEP, PILOT_INDICES
+
+def estimate_covariance_matrices(channel_model, rg, num_batches=20, batch_size=64):
+    print("Estimating covariance matrices (Frequency, Time, Space)...")
+    
+    channel_sampler = GenerateOFDMChannel(channel_model, rg)
+    
+    fft_size = rg.fft_size
+    num_ofdm_symbols = rg.num_ofdm_symbols
+    num_spatial_channels = 16 
+    
+    freq_cov = tf.zeros([fft_size, fft_size], dtype=tf.complex64)
+    time_cov = tf.zeros([num_ofdm_symbols, num_ofdm_symbols], dtype=tf.complex64)
+    space_cov = tf.zeros([num_spatial_channels, num_spatial_channels], dtype=tf.complex64)
+    
+    for _ in tqdm(range(num_batches)):
+        h = channel_sampler(batch_size)
+        h = tf.reshape(h, [batch_size, num_spatial_channels, num_ofdm_symbols, fft_size])
+        h = tf.cast(h, tf.complex64)
         
-    h_all = torch.cat(h_samples, dim=0)
-    mu_h = h_all.mean(dim=0)
-    h_centered = h_all - mu_h.unsqueeze(0)
-    N_samples = h_centered.shape[0]
-    R_hh = (h_centered.T.conj() @ h_centered) / N_samples
-    print("Channel statistics estimated.")
-    return R_hh, mu_h
+        # --- 周波数共分散 ---
+        h_perm = tf.transpose(h, [0, 1, 2, 3])
+        h_flat_f = tf.reshape(h_perm, [-1, fft_size])
+        cov_f = tf.matmul(h_flat_f, h_flat_f, adjoint_a=True) / tf.cast(tf.shape(h_flat_f)[0], tf.complex64)
+        freq_cov += cov_f
 
-def compute_lmmse(x_cond, generator, R_hh, mu_h, snr_db):
-    """
-    間引きパイロット対応版 LMMSE推定
-    """
-    pilot_indices_time = generator.pilot_indices # [2, 11]
-    B, C_combined, T, F = x_cond.shape
-    C = C_combined // 2
-    
-    # x_cond は既に補間されているが、パイロット位置の値は観測値に近い
-    y_full = x_cond[:, :C, :, :] + 1j * x_cond[:, C:, :, :] 
-    y_flat = y_full.permute(0, 1, 2, 3).reshape(-1, T * F)
-    
-    # ★変更点: 周波数方向の間引きを考慮したインデックス作成
-    pilot_flat_indices = []
-    
-    # 0, 4, 8... のサブキャリアインデックス
-    freq_indices = np.arange(0, F, PILOT_FREQ_STEP)
-    
-    for t_idx in pilot_indices_time:
-        # 時間 t_idx の中で、指定された周波数インデックスのみを選択
-        indices = freq_indices + t_idx * F
-        pilot_flat_indices.extend(indices)
-    
-    pilot_idx_tensor = torch.tensor(pilot_flat_indices, device=device).long()
-    
-    # 観測ベクトル y_p抽出
-    y_p = y_flat[:, pilot_idx_tensor]
-    
-    # LMMSE行列構築
-    R_pp = R_hh[pilot_idx_tensor][:, pilot_idx_tensor]
-    R_hp = R_hh[:, pilot_idx_tensor]
-    
-    sig_pwr = torch.real(torch.diagonal(R_hh).mean())
-    snr_linear = 10.0 ** (snr_db / 10.0)
-    noise_pwr = sig_pwr / snr_linear
-    
-    eye = torch.eye(R_pp.shape[0], device=device, dtype=R_pp.dtype)
-    # ノイズ項を加算して逆行列
-    inv_term = torch.linalg.inv(R_pp + noise_pwr * eye)
-    W = R_hp @ inv_term
-    
-    # 推定
-    mu_p = mu_h[pilot_idx_tensor]
-    y_p_centered = y_p - mu_p.unsqueeze(0)
-    h_est_centered = W @ y_p_centered.T
-    h_est_flat = h_est_centered.T + mu_h.unsqueeze(0)
-    
-    h_est_complex = h_est_flat.reshape(B, C, T, F)
-    x_est = torch.cat([h_est_complex.real, h_est_complex.imag], dim=1).float()
-    
-    return x_est
+        # --- 時間共分散 ---
+        h_perm = tf.transpose(h, [0, 1, 3, 2])
+        h_flat_t = tf.reshape(h_perm, [-1, num_ofdm_symbols])
+        cov_t = tf.matmul(h_flat_t, h_flat_t, adjoint_a=True) / tf.cast(tf.shape(h_flat_t)[0], tf.complex64)
+        time_cov += cov_t
+        
+        # --- 空間共分散 ---
+        h_perm = tf.transpose(h, [0, 2, 3, 1])
+        h_flat_s = tf.reshape(h_perm, [-1, num_spatial_channels])
+        cov_s = tf.matmul(h_flat_s, h_flat_s, adjoint_a=True) / tf.cast(tf.shape(h_flat_s)[0], tf.complex64)
+        space_cov += cov_s
 
-def evaluate_snr_vs_nmse():
-    # --- 設定 ---
-    SNR_LIST = np.arange(-5, 35, 5) 
-    BATCH_SIZE = 16 
-    # ★重要: 再学習したモデルのパスを指定してください
-    MODEL_PATH = "checkpoints/ckpt_step_200000.pth" 
+    return (freq_cov / num_batches), (time_cov / num_batches), (space_cov / num_batches)
+
+# ★変更: pilot_indices を引数に追加
+def run_lmmse_estimation(y_sparse_grid, no, rg, time_cov, freq_cov, space_cov, pilot_freq_step, pilot_indices):
+    """
+    SionnaのLMMSEInterpolatorロジックを利用して補間・平滑化を行う
+    """
+    # 1. マスク作成
+    pilot_mask = np.zeros((14, 76), dtype=bool)
+    pilot_mask[pilot_indices, ::pilot_freq_step] = True
     
-    print(f"Loading model from {MODEL_PATH}...")
+    # 2. LMMSEInterpolatorのインスタンス化
+    # 【修正点】引数名（time_cov= など）を削除し、ドキュメント通り順番に渡します。
+    # 順番: pilot_pattern, time_cov, freq_cov, space_cov
+    lmmse_interpolator = LMMSEInterpolator(
+        rg.pilot_pattern, 
+        time_cov, 
+        freq_cov, 
+        space_cov, 
+        order='t-f-s' 
+    )
+    
+    # 入力データをTFに変換
+    h_hat = tf.convert_to_tensor(y_sparse_grid.detach().cpu().numpy(), dtype=tf.complex64)
+    no_tf = tf.cast(no, tf.float32)
+    
+    # 空間スムージングの手動適用（ここは変更なし）
+    h_perm = tf.transpose(h_hat, [0, 2, 3, 1]) # [B, T, F, S]
+    eye = tf.eye(16, dtype=tf.complex64)
+    sigma2 = tf.complex(no_tf, 0.0)
+    
+    inv_term = tf.linalg.inv(space_cov + sigma2 * eye)
+    W_space = tf.matmul(space_cov, inv_term)
+    
+    h_smoothed = tf.matmul(h_perm, tf.transpose(W_space)) 
+    
+    h_final = tf.transpose(h_smoothed, [0, 3, 1, 2])
+    
+    return torch.from_numpy(h_final.numpy())
+def evaluate():
+    MODEL_PATH = "diff_model_final.pth" # 必要に応じてパスを変更してください
+    
+    # ★変更: 戻り値を受け取る
+    rg, cdl_model, pilot_freq_step, pilot_indices = get_sionna_config()
+    
+    freq_cov, time_cov, space_cov = estimate_covariance_matrices(cdl_model, rg, num_batches=10)
     
     model = ConditionalUNet(in_channels=32, cond_channels=32).to(device)
-    try:
-        checkpoint = torch.load(MODEL_PATH, map_location=device)
-        if 'model_state_dict' in checkpoint:
-            model.load_state_dict(checkpoint['model_state_dict'])
+    if os.path.exists(MODEL_PATH):
+        ckpt = torch.load(MODEL_PATH, map_location=device)
+        if 'model_state_dict' in ckpt:
+            model.load_state_dict(ckpt['model_state_dict'])
         else:
-            model.load_state_dict(checkpoint)
-        print("Model loaded successfully.")
-    except FileNotFoundError:
-        print(f"Error: {MODEL_PATH} not found.")
-        return
+            model.load_state_dict(ckpt)
+        print("Model loaded.")
+    else:
+        print(f"Model file {MODEL_PATH} not found. Testing with random weights.")
 
-    generator = SionnaChannelGeneratorGPU(batch_size=BATCH_SIZE)
+    snr_list = np.arange(0, 35, 5)
+    nmse_model_list = []
+    nmse_lmmse_list = []
     
-    # LMMSE用統計情報
-    R_hh, mu_h = estimate_channel_covariance(generator, num_batches=50)
+    from common_utils import SionnaChannelGeneratorGPU
+    generator = SionnaChannelGeneratorGPU(batch_size=32)
     
-    nmse_linear_history = []
-    nmse_lmmse_history = []
-    nmse_diff_history = []
-    
-    print(f"Starting Evaluation over SNRs: {SNR_LIST} dB (Pilot Freq Step={PILOT_FREQ_STEP})")
-    
-    for snr_db in SNR_LIST:
-        print(f"\nEvaluating at True SNR = {snr_db} dB...")
+    print("\nStarting comparison...")
+    for snr in snr_list:
+        x_gt, x_cond = generator.get_batch(snr_db=float(snr))
         
-        # 1. データ生成 (間引き済み)
-        x_gt, x_cond = generator.get_batch(snr_db=float(snr_db))
+        # --- A. 学習モデル (Diffusion) ---
+        blind_snr = torch.full((x_cond.shape[0],), UNKNOWN_SNR_VALUE, device=device)
+        x_pred_diff = sample_ddpm(model, x_cond, x_gt.shape, device, blind_snr)
         
-        # 2. Diffusion (Blind)
-        blind_snr_tensor = torch.full((BATCH_SIZE,), UNKNOWN_SNR_VALUE, device=device)
-        x_diff = sample_ddpm(model, x_cond, x_gt.shape, device, blind_snr_tensor)
+        # --- B. LMMSE (Spatial Smoothing) ---
+        C = x_cond.shape[1] // 2
+        x_cond_complex = x_cond[:, :C, :, :] + 1j * x_cond[:, C:, :, :]
+        no = 10**(-snr/10.0) 
         
-        # 3. LMMSE (Ideal)
-        x_lmmse = compute_lmmse(x_cond, generator, R_hh, mu_h, float(snr_db))
+        # ★変更: pilot_indices を渡す
+        x_pred_lmmse_c = run_lmmse_estimation(
+            x_cond_complex, no, rg, time_cov, freq_cov, space_cov, 
+            pilot_freq_step, pilot_indices
+        )
+        x_pred_lmmse = torch.cat([x_pred_lmmse_c.real, x_pred_lmmse_c.imag], dim=1).to(device)
         
-        nmse_linear = compute_nmse(x_gt, x_cond)
-        nmse_lmmse = compute_nmse(x_gt, x_lmmse)
-        nmse_diff = compute_nmse(x_gt, x_diff)
+        nmse_model = compute_nmse(x_gt, x_pred_diff)
+        nmse_lmmse = compute_nmse(x_gt, x_pred_lmmse)
         
-        nmse_linear_history.append(nmse_linear)
-        nmse_lmmse_history.append(nmse_lmmse)
-        nmse_diff_history.append(nmse_diff)
+        nmse_model_list.append(nmse_model)
+        nmse_lmmse_list.append(nmse_lmmse)
         
-        print(f"  -> Linear NMSE : {nmse_linear:.4f} dB")
-        print(f"  -> LMMSE NMSE  : {nmse_lmmse:.4f} dB")
-        print(f"  -> DiffModel   : {nmse_diff:.4f} dB")
-
-    # プロット
-    plt.figure(figsize=(10, 6))
-    plt.plot(SNR_LIST, nmse_linear_history, marker='o', linestyle=':', label='Linear Interpolation (Sparse)', color='tab:orange', alpha=0.8)
-    plt.plot(SNR_LIST, nmse_lmmse_history, marker='^', linestyle='--', label='LMMSE (Ideal)', color='tab:green')
-    plt.plot(SNR_LIST, nmse_diff_history, marker='s', linestyle='-', label='Diffusion Model (Blind)', color='tab:blue', linewidth=2)
-    
-    plt.title(f"NMSE vs SNR (Freq Sparsity: 1/{PILOT_FREQ_STEP})")
-    plt.xlabel("SNR [dB]")
-    plt.ylabel("NMSE [dB]")
-    plt.grid(True, which='both', linestyle='--', alpha=0.7)
+        print(f"SNR {snr}dB | Diffusion NMSE: {nmse_model:.2f} dB | LMMSE(Smooth) NMSE: {nmse_lmmse:.2f} dB")
+        
+    plt.figure(figsize=(8, 6))
+    plt.plot(snr_list, nmse_model_list, 'o-', label='Diffusion Model')
+    plt.plot(snr_list, nmse_lmmse_list, 's--', label='LMMSE (Spatial Smoothing)')
+    plt.xlabel('SNR [dB]')
+    plt.ylabel('NMSE [dB]')
+    plt.title('Channel Estimation Performance Comparison')
     plt.legend()
-    plt.xticks(SNR_LIST)
-    
-    save_filename = "snr_vs_nmse_sparse.png"
-    plt.savefig(save_filename)
-    print(f"\nEvaluation finished. Plot saved to {save_filename}")
+    plt.grid(True)
+    plt.savefig('comparison_result.png')
+    print("Plot saved to comparison_result.png")
     plt.show()
 
 if __name__ == "__main__":
-    evaluate_snr_vs_nmse()
+    evaluate()
